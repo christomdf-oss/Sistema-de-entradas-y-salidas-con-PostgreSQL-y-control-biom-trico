@@ -1,0 +1,74 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return signedIn() && exists(userPath()); }
+    function member(schoolId) {
+      return hasProfile() && get(userPath()).data.active == true &&
+        get(userPath()).data.schoolId == schoolId &&
+        get(userPath()).data.role in ['admin','staff'];
+    }
+    function isAdmin(schoolId) { return member(schoolId) && get(userPath()).data.role == 'admin'; }
+    function isActiveStudent(schoolId, id) {
+      return exists(/databases/$(database)/documents/schools/$(schoolId)/students/$(id)) &&
+        get(/databases/$(database)/documents/schools/$(schoolId)/students/$(id)).data.active != false;
+    }
+
+    // Las cuentas se provisionan inicialmente con el script de administrador.
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid ||
+        (resource.data.schoolId is string && isAdmin(resource.data.schoolId)));
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.schoolId is string &&
+        isAdmin(request.resource.data.schoolId) && request.resource.data.role in ['admin','staff'];
+      allow update: if signedIn() && isAdmin(resource.data.schoolId) &&
+        request.resource.data.schoolId == resource.data.schoolId &&
+        request.resource.data.role in ['admin','staff'];
+      allow delete: if false;
+    }
+
+    match /schools/{schoolId}/students/{studentId} {
+      allow read: if member(schoolId);
+      allow create: if isAdmin(schoolId) && request.resource.data.keys().hasOnly([
+        'nombre','matricula','telefono_tutor','correo_tutor','grupo','comunidad','active','enrollmentStatus','updatedAt'
+      ]);
+      allow update: if isAdmin(schoolId) && !('fingerprintTemplate' in request.resource.data);
+      allow delete: if isAdmin(schoolId);
+    }
+    // Las plantillas no están en los perfiles que consulta el personal.
+    match /schools/{schoolId}/fingerprints/{studentId} {
+      allow read: if isAdmin(schoolId);
+      // Solo el servicio local autenticado con Admin SDK crea/reemplaza plantillas.
+      allow create, update: if false;
+      allow delete: if isAdmin(schoolId);
+    }
+    match /schools/{schoolId}/asistencias/{attendanceId} {
+      allow read: if member(schoolId);
+      allow create: if member(schoolId) && request.resource.data.studentId is string &&
+        isActiveStudent(schoolId, request.resource.data.studentId) &&
+        request.resource.data.isManual == true &&
+        request.resource.data.type in ['entrada','salida','justificacion','permiso'];
+      // Anulación auditable: nunca se modifica ni se elimina un evento original.
+      allow update: if isAdmin(schoolId) && resource.data.voided != true &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['voided','voidReason','voidedBy','voidedAt']) &&
+        request.resource.data.voided == true &&
+        request.resource.data.voidReason is string &&
+        request.resource.data.voidReason.size() >= 8 &&
+        request.resource.data.voidReason.size() <= 300 &&
+        request.resource.data.voidedBy == request.auth.uid &&
+        request.resource.data.voidedAt == request.time;
+      allow delete: if isAdmin(schoolId);
+    }
+    match /schools/{schoolId}/communities/{id} {
+      allow read: if member(schoolId);
+      allow write: if isAdmin(schoolId);
+    }
+    match /schools/{schoolId}/settings/{id} {
+      allow read: if member(schoolId);
+      allow write: if isAdmin(schoolId) && !('gmailPassword' in request.resource.data) &&
+        !('GMAIL_APP_PASSWORD' in request.resource.data);
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

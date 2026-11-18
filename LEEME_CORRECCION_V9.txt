@@ -1,0 +1,11 @@
+CORRECCION V9 - Huellas y movimientos
+
+1. RESPALDA tu carpeta V9 actual y tu base PostgreSQL.
+2. Esta version NO incluye .env, .env.local ni serviceAccountKey.json. Copia tus propios archivos a la nueva carpeta en las ubicaciones originales.
+3. Antes de iniciar, abre pgAdmin, base zenkay > Query Tool y ejecuta docs/ACTUALIZAR_V9_AUDITORIA.sql.
+4. Inicia el sistema como antes.
+5. Eliminar huella revoca la plantilla, limpia el SDK y registra la accion en fingerprint_audit; volver a registrar crea otra accion. La auditoria NO guarda la huella eliminada.
+6. Se permiten varios movimientos por dia. El lector tiene una pausa de 10 segundos entre lecturas iguales para evitar dobles capturas accidentales.
+7. Para consultar la auditoria en pgAdmin: SELECT * FROM fingerprint_audit ORDER BY created_at DESC;
+
+No se ha probado con el sensor ZK9500 fisico ni con tu base real. Primero prueba con un alumno de ensayo.

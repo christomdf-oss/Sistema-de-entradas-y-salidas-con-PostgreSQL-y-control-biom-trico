@@ -1,0 +1,45 @@
+"""Comprobaciones estáticas de regresión: no sustituyen un build Next.js."""
+import unittest
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+
+
+class SharedStudentsTests(unittest.TestCase):
+    def test_single_shared_subscription_and_authenticated_layout(self):
+        provider = (ROOT / 'src/components/data/students-provider.tsx').read_text(encoding='utf-8')
+        layout = (ROOT / 'src/app/layout.tsx').read_text(encoding='utf-8')
+        self.assertIn("getDocsFromServer(schoolCollection(firestore, 'students'))", provider)
+        self.assertIn("where('updatedAt', '>=', cutoff)", provider)
+        self.assertIn('onSnapshot(changed', provider)
+        self.assertIn("<AuthProvider><StudentsProvider>", layout)
+        self.assertIn("</StudentsProvider></AuthProvider>", layout)
+        self.assertIn('<TodayAttendanceProvider>', layout)
+
+    def test_pages_reuse_shared_students_instead_of_refetching(self):
+        routes = ['page.tsx', 'students/page.tsx', 'attendance/page.tsx',
+                  'reports/page.tsx', 'manual-entry/page.tsx']
+        for route in routes:
+            with self.subTest(route=route):
+                text = (ROOT / 'src/app' / route).read_text(encoding='utf-8')
+                self.assertIn('useStudents()', text)
+                if route != 'students/page.tsx':
+                    self.assertNotIn("getDocs(schoolCollection(firestore, 'students'))", text)
+        # La eliminación administrativa explícita de pruebas sí puede consultar alumnos.
+        self.assertIn("getDocs(schoolCollection(firestore, 'students'))",
+                      (ROOT / 'src/app/students/page.tsx').read_text(encoding='utf-8'))
+
+    def test_daily_attendance_shared_month_only_exported(self):
+        attendance = (ROOT / 'src/app/attendance/page.tsx').read_text(encoding='utf-8')
+        dashboard = (ROOT / 'src/app/page.tsx').read_text(encoding='utf-8')
+        manual = (ROOT / 'src/app/manual-entry/page.tsx').read_text(encoding='utf-8')
+        self.assertIn('useTodayAttendance()', attendance)
+        self.assertIn('useTodayAttendance()', dashboard)
+        self.assertIn('useTodayAttendance()', manual)
+        self.assertIn('Solo al elegir "Exportar Reporte Mensual"', attendance)
+        self.assertNotIn("getDocs(query(schoolCollection(firestore, 'asistencias')", manual)
+
+    def test_sync_logs_reason_and_preserves_security_checks(self):
+        backend = (ROOT / 'docs/enroll_gui.py').read_text(encoding='utf-8')
+        self.assertIn('Sincronización COMPLETA:', backend)
+        self.assertIn('Sincronización INCREMENTAL:', backend)
+        self.assertIn("data = validate_student(student_id, person['template'])", backend)

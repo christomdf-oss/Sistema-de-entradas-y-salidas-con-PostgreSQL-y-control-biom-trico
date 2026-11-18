@@ -1,0 +1,304 @@
+"""Pruebas sin hardware ni credenciales reales: python -m unittest discover -s docs/tests -v"""
+import ast
+import base64
+from datetime import datetime, timedelta, timezone
+import logging
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import unittest
+
+DOCS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(DOCS))
+from biometric_cache import BiometricCache, event_id_for
+
+
+def enc(raw):
+    return b'cifrado:' + raw[::-1]
+
+
+def dec(raw):
+    assert raw.startswith(b'cifrado:')
+    return raw[len(b'cifrado:'):][::-1]
+
+
+class FakeSnapshot:
+    def __init__(self, id, data):
+        self.id = id
+        self.data = dict(data)
+        self.exists = True
+    def to_dict(self):
+        return dict(self.data)
+
+
+class FakeDocument:
+    def __init__(self, collection, id):
+        self.collection = collection
+        self.id = id
+    def get(self):
+        self.collection.gets += 1
+        obj = self.collection.data.get(self.id)
+        if obj is None:
+            return NoneSnapshot()
+        return FakeSnapshot(self.id, obj)
+    def create(self, data):
+        if self.id in self.collection.data:
+            raise AlreadyExists()
+        self.collection.data[self.id] = dict(data)
+        self.collection.creates += 1
+
+
+class NoneSnapshot:
+    exists = False
+    def to_dict(self):
+        return None
+
+
+class AlreadyExists(Exception):
+    pass
+
+
+class FakeQuery:
+    def __init__(self, collection, comparator, dt):
+        self.collection, self.comp, self.dt = collection, comparator, dt
+    def stream(self):
+        return [FakeSnapshot(k, v) for k, v in self.collection.data.items()
+                if v.get('updatedAt') is not None and
+                (v['updatedAt'] > self.dt if self.comp == '>' else v['updatedAt'] >= self.dt)]
+
+
+class FakeCollection:
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+        self.full_calls = 0
+        self.delta_calls = 0
+        self.gets = 0
+        self.creates = 0
+    def stream(self):
+        self.full_calls += 1
+        return [FakeSnapshot(k, v) for k, v in self.data.items()]
+    def where(self, name, comparator, value):
+        assert name == 'updatedAt'
+        self.delta_calls += 1
+        return FakeQuery(self, comparator, value)
+    def document(self, id):
+        return FakeDocument(self, id)
+
+
+class FakeSensor:
+    def __init__(self):
+        self.entries = {}
+        self.rebuilds = 0
+        self.adds = 0
+        self.sequence = []
+    def DBClear(self):
+        self.entries.clear()
+        self.rebuilds += 1
+    def DBAdd(self, sid, template):
+        self.adds += 1
+        self.entries[sid] = bytes(template)
+    def DBDel(self, sid):
+        del self.entries[sid]
+    def DBMatch(self, first, second):
+        return 1 if bytes(first) == bytes(second) else 0
+    def DBMerge(self, a, b, c):
+        return a if a == b == c else None
+    def AcquireFingerprint(self):
+        return self.sequence.pop(0) if self.sequence else None
+
+
+class SocketStub:
+    def __init__(self):
+        self.events = []
+    def emit(self, name, args):
+        self.events.append((name, args))
+
+
+class CacheTests(unittest.TestCase):
+    def test_cache_encrypted_and_persists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'biometrics.sqlite3'
+            c = BiometricCache(path, 'escuela', encrypt=enc, decrypt=dec)
+            c.save({'uno': {'student': {'nombre': 'NOMBRE_SUPER_SECRETO'}, 'template': 'base64Huellas'}},
+                   {'studentCursor': '2026-01-01T00:00:00+00:00', 'lastFullSync': 55})
+            self.assertNotIn(b'NOMBRE_SUPER_SECRETO', path.read_bytes())
+            self.assertNotIn(b'base64Huellas', path.read_bytes())
+            d = BiometricCache(path, 'escuela', encrypt=enc, decrypt=dec)
+            records, meta = d.load()
+            self.assertEqual(records['uno']['template'], 'base64Huellas')
+            self.assertEqual(meta['studentCursor'], '2026-01-01T00:00:00+00:00')
+            with self.assertRaises(RuntimeError):
+                BiometricCache(path, 'otra-escuela', encrypt=enc, decrypt=dec)
+
+    def test_incremental_save_replaces_only_one_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c = BiometricCache(Path(temp) / 'db.sqlite3', 'escuela', encrypt=enc, decrypt=dec)
+            c.save({'uno': {'student': {'nombre': 'uno'}, 'template': 'A'},
+                    'dos': {'student': {'nombre': 'dos'}, 'template': 'B'}}, {'cursor': 'viejo'})
+            c.save_changes({'uno': {'student': {'nombre': 'actualizado'}, 'template': 'A'}}, {'cursor': 'nuevo'})
+            records, meta = c.load()
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records['dos']['template'], 'B')
+            self.assertEqual(records['uno']['student']['nombre'], 'actualizado')
+            self.assertEqual(meta['cursor'], 'nuevo')
+
+    def test_email_outbox_and_idempotency(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c = BiometricCache(Path(temp) / 'db.sqlite3', 'escuela', encrypt=enc, decrypt=dec)
+            event_id = event_id_for('123', 'entrada', '2026-11-13')
+            self.assertEqual(event_id, event_id_for('123', 'entrada', '2026-11-13'))
+            self.assertNotEqual(event_id, event_id_for('123', 'salida', '2026-11-13'))
+            c.queue_email(event_id, 'persona@example.org', 'Alumno', 'entrada')
+            c.queue_email(event_id, 'persona@example.org', 'Alumno', 'entrada')
+            self.assertEqual(len(c.get_pending_emails()), 1)
+            c.finish_email(event_id, True, 0)
+            self.assertEqual(c.get_pending_emails(), [])
+            self.assertNotIn(b'persona@example.org', (Path(temp) / 'db.sqlite3').read_bytes())
+
+
+class SyncTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Extraer funciones PURAS de sincronización para ejecutar sin SDK ZKTeco.
+        source = ast.parse((DOCS / 'enroll_gui.py').read_text(encoding='utf-8'))
+        required = {'_cursor', '_advance_cursor', '_rebuild_sdk', '_update_one_sdk', '_remove_one_sdk',
+                    'sync_students', 'validate_student', 'register_attendance', 'enroll_fingerprint'}
+        fns = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in required]
+        for node in fns:
+            node.decorator_list = []  # quitar @app.route para probar sin Flask ni sensor
+        cls.code = compile(ast.Module(body=fns, type_ignores=[]), '<v8_backend>', 'exec')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = BiometricCache(Path(self.tmp.name) / 'cache.db', 'escuela', encrypt=enc, decrypt=dec)
+        self.time = datetime(2026, 11, 13, tzinfo=timezone.utc)
+        self.students = FakeCollection({str(i): {'nombre': f'Alumno {i}', 'active': True,
+                                                'enrollmentStatus': 'done', 'updatedAt': self.time}
+                                        for i in range(400)})
+        self.fingers = FakeCollection({str(i): {'template': base64.b64encode(f'finger-{i}'.encode()).decode(),
+                                                 'updatedAt': self.time} for i in range(400)})
+        self.attendance = FakeCollection()
+        self.marker = FakeCollection()
+        self.sensor = FakeSensor()
+        self.socket = SocketStub()
+        self.env = dict(sensor_lock=threading.RLock(), attendance_mode=False, attendance_thread=None,
+                        _sensor_dirty=False, students_db={}, _recent_success=set(), state_lock=threading.RLock(), cache=self.cache,
+                        sync_marker_ref=self.marker.document('biometricSync'),
+                        students_ref=self.students, fingerprint_ref=self.fingers,
+                        attendance_ref=self.attendance, zkfp=self.sensor, logging=logging,
+                        time=__import__('time'), datetime=datetime, timezone=timezone,
+                        CACHE_MAX_AGE=7 * 24 * 3600, base64=base64,
+                        normalize_template=lambda raw: raw, socketio=self.socket,
+                        event_id_for=event_id_for, AlreadyExists=AlreadyExists,
+                        firestore=type('Firestore', (), {'SERVER_TIMESTAMP': 'server-ts'}))
+        exec(self.code, self.env)
+
+    def test_full_then_two_delta_syncs_do_not_redownload_400(self):
+        sync = self.env['sync_students']
+        self.assertEqual(sync(), 400)
+        self.assertEqual(self.students.full_calls, 1)
+        self.assertEqual(self.fingers.full_calls, 1)
+        self.assertEqual(self.sensor.rebuilds, 1)
+        self.assertEqual(sync(), 400)
+        self.assertEqual(sync(), 400)
+        self.assertEqual(self.students.full_calls, 1)
+        self.assertEqual(self.fingers.full_calls, 1)
+        self.assertEqual(self.sensor.rebuilds, 1)
+        self.assertEqual(self.students.delta_calls, 2)
+        self.assertEqual(self.fingers.delta_calls, 2)
+
+    def test_one_modified_student_does_not_download_all(self):
+        sync = self.env['sync_students']
+        sync()
+        self.students.data['120']['nombre'] = 'Alumno cambiado'
+        self.students.data['120']['updatedAt'] = self.time + timedelta(seconds=1)
+        sync()
+        self.assertEqual(self.students.full_calls, 1)
+        self.assertEqual(self.sensor.rebuilds, 1)  # no DB clear / 400 DBAdd repetidos
+        self.assertEqual(self.sensor.adds, 401)  # solo uno nuevo
+        self.assertEqual(len(self.sensor.entries), 400)
+        self.assertEqual(next(p['nombre'] for p in self.env['students_db'].values() if p['studentId'] == '120'), 'Alumno cambiado')
+
+    def test_deactivated_student_is_removed_from_sensor(self):
+        sync = self.env['sync_students']
+        sync()
+        self.students.data['2'].update(active=False, updatedAt=self.time + timedelta(seconds=1))
+        sync()
+        self.assertEqual(len(self.env['students_db']), 399)
+        self.assertEqual(self.fingers.full_calls, 1)
+
+    def test_remove_and_reregister_same_finger_without_full_download(self):
+        sync = self.env['sync_students']
+        sync()  # carga inicial una vez
+        self.students.data['2'].update(enrollmentStatus='pending', updatedAt=self.time + timedelta(seconds=1))
+        self.fingers.data['2'].update(template=None, updatedAt=self.time + timedelta(seconds=1))
+        sync()
+        self.assertEqual(len(self.sensor.entries), 399)
+        self.assertEqual(self.sensor.rebuilds, 1)
+        # Registrar la misma huella otra vez no reconstruye ni lee los 400 alumnos.
+        self.students.data['2'].update(enrollmentStatus='done', updatedAt=self.time + timedelta(seconds=2))
+        self.fingers.data['2'].update(template=base64.b64encode(b'finger-2').decode(),
+                                      updatedAt=self.time + timedelta(seconds=2))
+        sync()
+        self.assertEqual(len(self.sensor.entries), 400)
+        self.assertEqual(self.sensor.rebuilds, 1)
+        self.assertEqual(self.students.full_calls, 1)
+        self.assertEqual(self.fingers.full_calls, 1)
+
+    def test_duplicate_attendance_creates_only_one_document_and_email(self):
+        sync = self.env['sync_students']
+        sync()
+        self.env['register_attendance'](1, 'entrada')
+        self.env['register_attendance'](1, 'entrada')
+        self.assertEqual(self.attendance.creates, 1)
+        self.assertEqual(len(self.attendance.data), 1)
+        self.assertEqual(self.students.gets, 1)
+        self.assertEqual(self.fingers.gets, 1)
+
+    def test_manual_invalidation_forces_full_refresh(self):
+        sync = self.env['sync_students']
+        sync()
+        sync()
+        self.assertEqual(self.students.full_calls, 1)
+        self.marker.data['biometricSync'] = {'cacheEpoch': self.time + timedelta(seconds=3)}
+        sync()
+        self.assertEqual(self.students.full_calls, 2)
+        self.assertEqual(self.fingers.full_calls, 2)
+
+    def test_four_separate_captures_register_only_one_template(self):
+        sync = self.env['sync_students']
+        sync()
+        self.students.data['400'] = {'nombre': 'Alumno nuevo', 'active': True,
+                                     'enrollmentStatus': 'pending', 'updatedAt': self.time}
+        self.sensor.sequence = [b'nueva', None, b'nueva', None, b'nueva', None, b'nueva']
+        class Batch:
+            def __init__(self): self.actions = []
+            def set(self, doc, obj): self.actions.append((doc, obj))
+            def update(self, doc, obj): self.actions.append((doc, obj))
+            def commit(self):
+                for doc, obj in self.actions:
+                    doc.collection.data.setdefault(doc.id, {}).update(obj)
+        class DB:
+            def batch(self): return Batch()
+        self.env.update(db=DB(),
+                        request=type('Request', (), {'get_json': lambda self, silent=True:
+                            {'studentId': '400', 'schoolId': 'escuela'}})(),
+                        SCHOOL_ID='escuela', protected=lambda required='staff': None,
+                        jsonify=lambda value: value,
+                        from_capture=lambda result: result)
+        original_full = self.students.full_calls
+        original_adds = self.sensor.adds
+        result = self.env['enroll_fingerprint']()
+        self.assertTrue(result['success'])
+        self.assertEqual(self.students.full_calls, original_full)
+        self.assertEqual(self.sensor.adds, original_adds + 1)
+        self.assertEqual(len(self.fingers.data), 401)
+        self.assertEqual(len(self.env['students_db']), 401)
+        self.assertEqual(len(self.cache.load()[0]), 401)
+
+
+
+if __name__ == '__main__':
+    unittest.main()

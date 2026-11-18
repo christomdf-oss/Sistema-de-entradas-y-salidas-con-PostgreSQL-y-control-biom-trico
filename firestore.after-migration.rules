@@ -1,0 +1,8 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Publicar SOLO tras comprobar la migración completa y dejar de usar Firestore.
+    // Firebase Authentication con Google sigue funcionando: no depende de estas reglas.
+    match /{document=**} { allow read, write: if false; }
+  }
+}

@@ -1,0 +1,167 @@
+'use client';
+
+import * as React from 'react';
+import {
+  ColumnDef,
+  flexRender,
+  getCoreRowModel,
+  getPaginationRowModel,
+  getSortedRowModel,
+  getFilteredRowModel,
+  useReactTable,
+  type SortingState,
+  type ColumnFiltersState,
+} from '@tanstack/react-table';
+
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Skeleton } from '@/components/ui/skeleton';
+
+interface DataTableProps<TData, TValue> {
+  columns: ColumnDef<TData, TValue>[];
+  data: TData[];
+  isLoading?: boolean;
+}
+
+export function DataTable<TData, TValue>({
+  columns,
+  data,
+  isLoading = false,
+}: DataTableProps<TData, TValue>) {
+  const [sorting, setSorting] = React.useState<SortingState>([]);
+  const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
+    []
+  );
+
+  const table = useReactTable({
+    data,
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+    getPaginationRowModel: getPaginationRowModel(),
+    onSortingChange: setSorting,
+    getSortedRowModel: getSortedRowModel(),
+    onColumnFiltersChange: setColumnFilters,
+    getFilteredRowModel: getFilteredRowModel(),
+    // El ID interno de Firestore es único, incluso si la matrícula está vacía.
+    getRowId: (row, index) => String((row as { id?: string }).id || `sin-id-${index}`),
+    state: {
+      sorting,
+      columnFilters,
+    },
+  });
+
+  // SkeletonRow now accepts column count to avoid depending on the columns prop directly
+  const SkeletonRow = ({ columnCount }: { columnCount: number }) => (
+    <TableRow>
+      {Array.from({ length: columnCount }).map((_, index) => (
+        <TableCell key={`skeleton-cell-${index}`}>
+          <Skeleton className="h-6 w-full" />
+        </TableCell>
+      ))}
+    </TableRow>
+  );
+
+  return (
+    <div>
+      <div className="flex items-center gap-4 py-4">
+        <Input
+          placeholder="Filtrar por nombre..."
+          value={(table.getColumn('nombre')?.getFilterValue() as string) ?? ''}
+          onChange={(event) =>
+            table.getColumn('nombre')?.setFilterValue(event.target.value)
+          }
+          className="max-w-sm"
+        />
+        <Input
+          placeholder="Filtrar por grupo..."
+          value={(table.getColumn('grupo')?.getFilterValue() as string) ?? ''}
+          onChange={(event) =>
+            table.getColumn('grupo')?.setFilterValue(event.target.value)
+          }
+          className="max-w-sm"
+        />
+      </div>
+      <div className="rounded-md border">
+        <Table>
+          <TableHeader>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <TableRow key={headerGroup.id}>
+                {headerGroup.headers.map((header) => {
+                  return (
+                    <TableHead key={header.id}>
+                      {header.isPlaceholder
+                        ? null
+                        : flexRender(
+                            header.column.columnDef.header,
+                            header.getContext()
+                          )}
+                    </TableHead>
+                  );
+                })}
+              </TableRow>
+            ))}
+          </TableHeader>
+          <TableBody>
+            {isLoading ? (
+              // Use a map to render skeletons with unique keys
+              Array.from({ length: 5 }).map((_, index) => (
+                <SkeletonRow key={`skeleton-row-${index}`} columnCount={columns.length} />
+              ))
+            ) : table.getRowModel().rows?.length ? (
+              table.getRowModel().rows.map((row) => (
+                <TableRow
+                  key={row.id} // Identificador interno estable del alumno
+                  data-state={row.getIsSelected() && 'selected'}
+                >
+                  {row.getVisibleCells().map((cell) => (
+                    <TableCell key={cell.id}>
+                      {flexRender(
+                        cell.column.columnDef.cell,
+                        cell.getContext()
+                      )}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))
+            ) : (
+              <TableRow>
+                <TableCell
+                  colSpan={columns.length}
+                  className="h-24 text-center"
+                >
+                  No hay resultados.
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </div>
+      <div className="flex items-center justify-end space-x-2 py-4">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => table.previousPage()}
+          disabled={!table.getCanPreviousPage()}
+        >
+          Anterior
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => table.nextPage()}
+          disabled={!table.getCanNextPage()}
+        >
+          Siguiente
+        </Button>
+      </div>
+    </div>
+  );
+}
