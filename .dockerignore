@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+.idx
+docs/venv
+docs/.env
+.env*
+**/serviceAccountKey.json
+docs/.private
+__pycache__
+*.pyc
